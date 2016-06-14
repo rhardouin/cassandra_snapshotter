@@ -58,6 +58,7 @@ def run_backup(args):
         cassandra_bin_dir=args.cassandra_bin_dir,
         backup_schema=args.backup_schema,
         buffer_size=args.buffer_size,
+        no_compression=args.no_compression,
         use_sudo=args.use_sudo,
         connection_pool_size=args.connection_pool_size,
         exclude_tables=args.exclude_tables,
@@ -149,6 +150,11 @@ def main():
         '--buffer-size',
         default=64,
         help="The buffer size (MB) for compress and upload")
+
+    backup_parser.add_argument(
+        '--no-compression',
+        action='store_true',
+        help="If set, data will be uploaded as is, without LZO compression.")
 
     backup_parser.add_argument(
         '--exclude-tables',
