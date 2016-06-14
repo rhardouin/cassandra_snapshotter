@@ -2,6 +2,7 @@ from __future__ import (absolute_import, print_function)
 
 import boto
 from boto.s3.connection import S3Connection
+from filechunkio import FileChunkIO
 from yaml import load
 
 try:
@@ -13,6 +14,7 @@ import os
 import time
 import glob
 import logging
+import math
 import multiprocessing
 from multiprocessing.dummy import Pool
 
@@ -60,7 +62,8 @@ def s3_progress_update_callback(*args):
 
 
 @map_wrap
-def upload_file(bucket, source, destination, s3_ssenc, bufsize, reduced_redundancy, rate_limit):
+def upload_file(bucket, source, destination, s3_ssenc, bufsize, compressed,
+                reduced_redundancy, rate_limit):
     mp = None
     retry_count = 0
     sleep_time = SLEEP_TIME
@@ -77,8 +80,21 @@ def upload_file(bucket, source, destination, s3_ssenc, bufsize, reduced_redundan
                     raise
 
             try:
-                for i, chunk in enumerate(compressed_pipe(source, bufsize, rate_limit)):
-                    mp.upload_part_from_file(chunk, i + 1, cb=s3_progress_update_callback)
+                if compressed:
+                    for i, chunk in enumerate(compressed_pipe(source, bufsize, rate_limit)):
+                        mp.upload_part_from_file(chunk, i + 1, cb=s3_progress_update_callback)
+                else:
+                    source_size = os.path.getsize(source)
+                    chunk_count = int(math.ceil(source_size / float(bufsize)))
+
+                    for i in range(chunk_count):
+                        offset = bufsize * i
+                        num_bytes = min(bufsize, source_size - offset)
+
+                        with FileChunkIO(source, 'r',
+                                         offset=offset, bytes=num_bytes) as fp:
+                            mp.upload_part_from_file(fp, part_num=i + 1)
+
             except Exception as exc:
                 logger.error("Error uploading file {!s} to {!s}".format(source, destination))
                 logger.error(exc.message)
@@ -147,11 +163,13 @@ def cancel_upload(bucket, mp, remote_path):
 def put_from_manifest(
         s3_bucket, s3_connection_host, s3_ssenc, s3_base_path,
         aws_access_key_id, aws_secret_access_key, manifest,
-        bufsize, reduced_redundancy, rate_limit, concurrency=None, incremental_backups=False):
+        bufsize, compressed, reduced_redundancy, rate_limit,
+        concurrency=None, incremental_backups=False):
     """
     Uploads files listed in a manifest to amazon S3
-    to support larger than 5GB files multipart upload is used (chunks of 60MB)
-    files are uploaded compressed with lzop, the .lzo suffix is appended
+    to support larger than 5GB files multipart upload is used (chunks of 60MB).
+    If compression is enabled (default) files are uploaded compressed with lzop
+    and the .lzo suffix is appended
     """
     exit_code = 0
     bucket = get_bucket(
@@ -161,8 +179,7 @@ def put_from_manifest(
     buffer_size = int(bufsize * MBFACTOR)
     files = manifest_fp.read().splitlines()
     pool = Pool(concurrency)
-    for f in pool.imap(upload_file,
-                       ((bucket, f, destination_path(s3_base_path, f), s3_ssenc, buffer_size, reduced_redundancy, rate_limit) for f in files if f)):
+    for f in pool.imap(upload_file, ((bucket, f, destination_path(s3_base_path, f, compressed), s3_ssenc, buffer_size, compressed, reduced_redundancy, rate_limit) for f in files if f)):
         if f is None:
             # Upload failed.
             exit_code = 1
@@ -248,6 +265,11 @@ def main():
         help="Compress and upload buffer size")
 
     put_parser.add_argument(
+        '--no-compression',
+        action='store_true',
+        help="If set, data will be uploaded as is, without LZO compression.")
+
+    put_parser.add_argument(
         '--manifest',
         required=True,
         help="The manifest containing the files to put on s3")
@@ -299,7 +321,10 @@ def main():
         )
 
     if subcommand == 'put':
-        check_lzop()
+        compressed = not args.no_compression
+
+        if compressed:
+            check_lzop()
 
         if args.rate_limit > 0:
             check_pv()
@@ -313,6 +338,7 @@ def main():
             args.aws_secret_access_key,
             args.manifest,
             args.bufsize,
+            compressed,
             args.reduced_redundancy,
             args.rate_limit,
             args.concurrency,
